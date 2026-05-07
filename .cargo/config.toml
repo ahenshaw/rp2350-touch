@@ -1,0 +1,8 @@
+[target.thumbv8m.main-none-eabihf]
+runner = ["sh", "-c", "picotool load -f -t elf \"$1\" && picotool reboot", "--"]
+rustflags = [
+  "-C", "link-arg=-Tlink.x",
+]
+
+[build]
+target = "thumbv8m.main-none-eabihf"
