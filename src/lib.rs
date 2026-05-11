@@ -1,13 +1,18 @@
 #![no_std]
 
 use embedded_graphics::{pixelcolor::Rgb565, prelude::*, primitives::Rectangle};
-use embedded_hal::{delay::DelayNs, digital::OutputPin};
+use embedded_hal::{
+    delay::DelayNs,
+    digital::{InputPin, OutputPin},
+    i2c::I2c as I2cDevice,
+};
 use hal::{
-    clocks::init_clocks_and_plls,
-    gpio::{FunctionPio0, Pins},
+    clocks::{init_clocks_and_plls, Clock},
+    fugit::RateExtU32,
+    gpio::{FunctionI2c, FunctionPio0, Pins, PullUp},
     pac,
     pio::{Buffers, PIOBuilder, PIOExt, PinDir, ShiftDirection, Tx},
-    Sio, Timer, Watchdog,
+    Sio, Timer, Watchdog, I2C,
 };
 use pio::pio_asm;
 use rp235x_hal as hal;
@@ -22,6 +27,10 @@ const X_OFFSET: u16 = 6;
 
 // 466×466×2 ≈ 424 KB; fits in the RP2350's 520 KB RAM.
 static mut FRAMEBUF: [u16; W as usize * H as usize] = [0; W as usize * H as usize];
+
+pub fn framebuf_mut() -> &'static mut [u16] {
+    unsafe { &mut *core::ptr::addr_of_mut!(FRAMEBUF) }
+}
 
 type PioTx = Tx<(pac::PIO0, hal::pio::SM0)>;
 
@@ -44,6 +53,49 @@ impl Rng {
     }
 }
 
+// ── Touch controller (FT6146) ─────────────────────────────────────────────────
+
+const FT6146_ADDR: u8 = 0x38;
+
+pub struct Touch<I: I2cDevice, INT: InputPin, RST: OutputPin> {
+    i2c: I,
+    // Owned to prevent reuse; not read at runtime.
+    _int: INT,
+    _rst: RST,
+}
+
+impl<I: I2cDevice, INT: InputPin, RST: OutputPin> Touch<I, INT, RST> {
+    fn new(mut i2c: I, int: INT, mut rst: RST, delay: &mut impl DelayNs) -> Self {
+        rst.set_low().ok();
+        delay.delay_ms(10);
+        rst.set_high().ok();
+        delay.delay_ms(50);
+        // Switch to polling mode (register G_MODE = 0)
+        i2c.write(FT6146_ADDR, &[0xA4, 0x00]).ok();
+        Self { i2c, _int: int, _rst: rst }
+    }
+
+    /// Returns `Some((x, y))` when a finger is on the screen, `None` otherwise.
+    pub fn read(&mut self) -> Option<(i32, i32)> {
+        let mut buf = [0u8; 5];
+        self.i2c.write_read(FT6146_ADDR, &[0x02], &mut buf).ok()?;
+        if buf[0] & 0x0F == 0 {
+            return None;
+        }
+        // buf[1] = XH: event[7:6], x_high[3:0]
+        // buf[2] = XL: x_low[7:0]
+        // buf[3] = YH: touch_id[7:4], y_high[3:0]
+        // buf[4] = YL: y_low[7:0]
+        let event = (buf[1] >> 6) & 0x03;
+        if event == 1 {
+            return None; // lift-up
+        }
+        let x = (((buf[1] & 0x0F) as i32) << 8) | buf[2] as i32;
+        let y = (((buf[3] & 0x0F) as i32) << 8) | buf[4] as i32;
+        Some((x, y))
+    }
+}
+
 // ── Display driver ────────────────────────────────────────────────────────────
 
 pub struct Display<CS: OutputPin, RST: OutputPin, PWR: OutputPin> {
@@ -53,26 +105,31 @@ pub struct Display<CS: OutputPin, RST: OutputPin, PWR: OutputPin> {
     pwr: PWR,
 }
 
-/// Initialise all board hardware and return a display handle and a delay timer.
-pub fn init() -> (Display<impl OutputPin + use<>, impl OutputPin + use<>, impl OutputPin + use<>>, impl DelayNs + use<>) {
+/// Initialise all board hardware and return a display handle, touch handle, and a delay timer.
+pub fn init() -> (
+    Display<impl OutputPin + use<>, impl OutputPin + use<>, impl OutputPin + use<>>,
+    Touch<impl I2cDevice + use<>, impl InputPin + use<>, impl OutputPin + use<>>,
+    impl DelayNs + use<>,
+) {
     let mut pac = pac::Peripherals::take().unwrap();
     let mut watchdog = Watchdog::new(pac.WATCHDOG);
     let clocks = init_clocks_and_plls(
         12_000_000u32, pac.XOSC, pac.CLOCKS, pac.PLL_SYS, pac.PLL_USB,
         &mut pac.RESETS, &mut watchdog,
     ).ok().unwrap();
-    let timer = Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
+    let mut timer = Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
     let sio = Sio::new(pac.SIO);
     let pins = Pins::new(pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, &mut pac.RESETS);
-    let display = new_display(pac.PIO0, &mut pac.RESETS, pins);
-    (display, timer)
-}
 
-fn new_display(
-    pio0: pac::PIO0,
-    resets: &mut pac::RESETS,
-    pins: Pins,
-) -> Display<impl OutputPin + use<>, impl OutputPin + use<>, impl OutputPin + use<>> {
+    // ── Touch ─────────────────────────────────────────────────────────────────
+    let sda = pins.gpio6.reconfigure::<FunctionI2c, PullUp>();
+    let scl = pins.gpio7.reconfigure::<FunctionI2c, PullUp>();
+    let i2c = I2C::i2c1(pac.I2C1, sda, scl, 400u32.kHz(), &mut pac.RESETS, clocks.system_clock.freq());
+    let touch_int = pins.gpio20.into_pull_up_input();
+    let touch_rst = pins.gpio17.into_push_pull_output();
+    let touch = Touch::new(i2c, touch_int, touch_rst, &mut timer);
+
+    // ── Display ───────────────────────────────────────────────────────────────
     // Assign QSPI clock and data pins to PIO0; hardware retains the
     // function after the typed handles are dropped.
     let _ = (
@@ -82,13 +139,14 @@ fn new_display(
         pins.gpio13.into_function::<FunctionPio0>(), // D2
         pins.gpio14.into_function::<FunctionPio0>(), // D3
     );
-    Display::new(
-        pio0,
-        resets,
+    let display = Display::new(
+        pac.PIO0, &mut pac.RESETS,
         pins.gpio15.into_push_pull_output(), // CS
         pins.gpio16.into_push_pull_output(), // RST
         pins.gpio19.into_push_pull_output(), // PWR
-    )
+    );
+
+    (display, touch, timer)
 }
 
 impl<CS: OutputPin, RST: OutputPin, PWR: OutputPin> Display<CS, RST, PWR> {

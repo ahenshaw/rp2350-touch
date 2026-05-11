@@ -787,6 +787,7 @@ dependencies = [
  "cortex-m-rt",
  "embedded-graphics",
  "embedded-hal 1.0.0",
+ "micromath",
  "panic-halt",
  "pio",
  "pio-proc",
