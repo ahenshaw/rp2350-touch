@@ -34,6 +34,35 @@ pub fn framebuf_mut() -> &'static mut [u16] {
 
 type PioTx = Tx<(pac::PIO0, hal::pio::SM0)>;
 
+// ── Battery ───────────────────────────────────────────────────────────────────
+
+/// Raw 12-bit ADC reading from GPIO 26 (200 K/100 K divider).
+/// GPIO 26 and the ADC peripheral are fully configured by init().
+/// Runs 32 conversions (first 16 discarded as warm-up) and returns the average.
+pub fn read_battery_raw() -> u16 {
+    let p = unsafe { pac::Peripherals::steal() };
+    let mut sum = 0u32;
+    for i in 0u32..32 {
+        while !p.ADC.cs().read().ready().bit_is_set() {}
+        p.ADC.cs().modify(|_, w| unsafe { w.ainsel().bits(0).start_once().set_bit() });
+        while !p.ADC.cs().read().ready().bit_is_set() {}
+        let val = p.ADC.result().read().result().bits() as u32;
+        if i >= 16 { sum += val; }
+    }
+    (sum / 16) as u16
+}
+
+/// Convert a raw ADC reading to 0–100 % for a LiPo via the 200 K/100 K divider.
+/// 3.0 V empty (raw ≈ 1241) → 4.2 V full (raw ≈ 1737).
+pub fn battery_raw_to_pct(raw: u16) -> u8 {
+    const RAW_EMPTY: u32 = 1241;
+    const RAW_FULL:  u32 = 1737;
+    let raw = raw as u32;
+    if raw <= RAW_EMPTY { return 0; }
+    if raw >= RAW_FULL  { return 100; }
+    ((raw - RAW_EMPTY) * 100 / (RAW_FULL - RAW_EMPTY)) as u8
+}
+
 // ── RNG ───────────────────────────────────────────────────────────────────────
 
 pub struct Rng(u32);
@@ -121,6 +150,16 @@ pub fn init() -> (
     let sio = Sio::new(pac.SIO);
     let pins = Pins::new(pac.IO_BANK0, pac.PADS_BANK0, sio.gpio_bank0, &mut pac.RESETS);
 
+    // ── ADC / Battery ─────────────────────────────────────────────────────────
+    // Use the HAL to configure GPIO 26 and the ADC so that all RP2350-specific
+    // pad details (ISO bit, OE override, input-enable) are handled correctly.
+    // Neither AdcPin nor Adc has a Drop impl, so the hardware config persists.
+    {
+        let gpio26 = pins.gpio26.into_floating_input();
+        let _adc_pin = hal::adc::AdcPin::new(gpio26).unwrap();
+        let _adc = hal::adc::Adc::new(pac.ADC, &mut pac.RESETS);
+    }
+
     // ── Touch ─────────────────────────────────────────────────────────────────
     let sda = pins.gpio6.reconfigure::<FunctionI2c, PullUp>();
     let scl = pins.gpio7.reconfigure::<FunctionI2c, PullUp>();
@@ -202,6 +241,12 @@ impl<CS: OutputPin, RST: OutputPin, PWR: OutputPin> Display<CS, RST, PWR> {
         delay.delay_ms(100);
         self.rst.set_high().ok();
         delay.delay_ms(200);
+    }
+
+    /// Cut display power (call before entering dormant).
+    pub fn power_off(&mut self) {
+        self.cs.set_high().ok();
+        self.pwr.set_low().ok();
     }
 
     /// CO5300 initialisation sequence.

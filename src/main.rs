@@ -11,7 +11,10 @@ use embedded_graphics::{pixelcolor::Rgb565, prelude::*, primitives::Rectangle};
 use embedded_hal::delay::DelayNs;
 use micromath::F32Ext;
 use panic_halt as _;
-use rp2350_touch::{framebuf_mut, init, Rng, H, W};
+use rp235x_hal as hal;
+use rp2350_touch::{battery_raw_to_pct, framebuf_mut, init, read_battery_raw, Display, Rng, H, W};
+
+use embedded_hal::digital::OutputPin;
 
 const CX: f32 = 233.0;
 const CY: f32 = 233.0;
@@ -385,6 +388,19 @@ fn main() -> ! {
 
     let mut rng = Rng::new(0xBEEF_CAFE);
 
+    // ── Splash screen ─────────────────────────────────────────────────────────
+    {
+        let buf = framebuf_mut();
+        let splash = include_bytes!("splash.raw");
+        for (dst, src) in buf.iter_mut().zip(splash.chunks_exact(2)) {
+            *dst = u16::from_be_bytes([src[0], src[1]]);
+        }
+        draw_battery(buf, battery_raw_to_pct(read_battery_raw()));
+    }
+    display.flush(Rectangle::new(Point::zero(), Size::new(W as u32, H as u32)));
+    loop { if touch.read().is_some() { break; } }
+    loop { if touch.read().is_none() { break; } }
+
     // Track geometry is fixed by the arena constants — compute once.
     let p_track = make_track(PLAYER_BASE);
     let c_track = make_track(COMPUTER_BASE);
@@ -429,11 +445,19 @@ fn main() -> ! {
 
             display.flush(Rectangle::new(Point::zero(), Size::new(W as u32, H as u32)));
 
+            // Sleep after 15 s of inactivity on the difficulty screen.
+            let mut idle_ms: u32 = 0;
             let result = loop {
                 if let Some((_tx, ty)) = touch.read() {
+                    idle_ms = 0;
                     if ty >=  60 && ty < 125 { break (2.5_f32, 35.0_f32); }
                     if ty >= 200 && ty < 265 { break (4.5_f32, 50.0_f32); }
-                    if ty >= 340 && ty < 405 { break (8.0_f32, 70.0_f32); }
+                    if ty >= 340 && ty < 405 { break (6.5_f32, 62.0_f32); }
+                }
+                timer.delay_ms(1u32);
+                idle_ms += 1;
+                if idle_ms >= 15_000 {
+                    enter_dormant(&mut display);
                 }
             };
             while touch.read().is_some() {}
@@ -788,4 +812,94 @@ fn main() -> ! {
             }
         }
     }
+}
+
+fn draw_battery(buf: &mut [u16], pct: u8) {
+    const BW: i32 = 32;
+    const BH: i32 = 16;
+    // Centre the body+nub (total width 36) at x=233, y=422.
+    const BX: i32 = 233 - (BW + 4) / 2; // = 215
+    const BY: i32 = 422;
+    const NW: i32 = 4;
+    const NH: i32 = 8;
+
+    let color: u16 = if pct >= 50 { 0x07E0 }       // green
+                     else if pct >= 20 { 0xFFE0 }   // yellow
+                     else { 0xF800 };               // red
+
+    // Terminal nub (right side, vertically centred)
+    let ny = BY + (BH - NH) / 2;
+    fill_rect(buf, BX + BW, ny, BX + BW + NW, ny + NH, 0xFFFF);
+
+    // Body outline (1-px white border)
+    fill_rect(buf, BX,          BY,          BX + BW,     BY + 1,      0xFFFF); // top
+    fill_rect(buf, BX,          BY + BH - 1, BX + BW,     BY + BH,     0xFFFF); // bottom
+    fill_rect(buf, BX,          BY,          BX + 1,      BY + BH,     0xFFFF); // left
+    fill_rect(buf, BX + BW - 1, BY,          BX + BW,     BY + BH,     0xFFFF); // right
+
+    // Coloured fill proportional to charge
+    let fill_w = (pct as i32 * (BW - 2) + 50) / 100; // round
+    if fill_w > 0 {
+        fill_rect(buf, BX + 1, BY + 1, BX + 1 + fill_w, BY + BH - 1, color);
+    }
+    // Black out unfilled interior
+    if fill_w < BW - 2 {
+        fill_rect(buf, BX + 1 + fill_w, BY + 1, BX + BW - 1, BY + BH - 1, 0x0000);
+    }
+}
+
+/// Turn off the display and enter RP2350 DORMANT mode.
+/// Only a GPIO 15 falling edge (BOOT button → CS line) or RESET can wake the chip.
+/// On wake the chip reboots cleanly, restarting at the splash screen.
+fn enter_dormant<CS: OutputPin, RST: OutputPin, PWR: OutputPin>(
+    display: &mut Display<CS, RST, PWR>,
+) -> ! {
+    use hal::{
+        pac,
+        reboot::{reboot, RebootArch, RebootKind},
+        rosc::RingOscillator,
+    };
+
+    display.power_off();
+
+    // Safety: PAC is stolen only here, after init() has finished.
+    let p = unsafe { pac::Peripherals::steal() };
+
+    // ── Configure dormant wake on GPIO 15 falling edge ────────────────────────
+    // DORMANT_WAKE_INTE register 1 covers GPIOs 8-15.
+    // GPIO 15 = gpio7 slot within that register.
+    // Clear any latched edge first, then enable the interrupt.
+    // INTR is W1C; GPIO 15 EDGE_LOW = bit 30 of register 1 ((15-8)*4 + 2).
+    p.IO_BANK0.intr(1).write(|w| unsafe { w.bits(1 << 30) });
+    p.IO_BANK0
+        .dormant_wake_inte(1)
+        .modify(|_, w| w.gpio7_edge_low().set_bit());
+
+    // ── Switch clocks off PLL onto ROSC ───────────────────────────────────────
+    // clk_sys → clk_ref (glitchless mux; bit 0 clear = CLK_REF)
+    p.CLOCKS.clk_sys_ctrl().modify(|_, w| w.src().clk_ref());
+    while p.CLOCKS.clk_sys_selected().read().bits() != 1 {}
+
+    // clk_ref → ROSC phase-shifted output
+    p.CLOCKS
+        .clk_ref_ctrl()
+        .modify(|_, w| w.src().rosc_clksrc_ph());
+    while p.CLOCKS.clk_ref_selected().read().bits() != 1 {}
+
+    // Power down both PLLs (all powerdown bits set)
+    p.PLL_SYS
+        .pwr()
+        .write(|w| w.pd().set_bit().vcopd().set_bit().postdivpd().set_bit().dsmpd().set_bit());
+    p.PLL_USB
+        .pwr()
+        .write(|w| w.pd().set_bit().vcopd().set_bit().postdivpd().set_bit().dsmpd().set_bit());
+
+    // ── Enter ROSC dormant ────────────────────────────────────────────────────
+    // The chip halts here; execution resumes after a GPIO 15 edge wake event.
+    let rosc = RingOscillator::new(p.ROSC);
+    let rosc = rosc.initialize();
+    unsafe { rosc.dormant() };
+
+    // Woke up — reboot so firmware restarts from the top (splash screen).
+    reboot(RebootKind::Normal, RebootArch::Normal)
 }
