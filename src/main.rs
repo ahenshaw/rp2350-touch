@@ -400,15 +400,18 @@ fn main() -> ! {
     display.flush(Rectangle::new(Point::zero(), Size::new(W as u32, H as u32)));
     {
         let mut ms: u32 = 0;
+        let mut idle_ms: u32 = 0;
         loop {
             timer.delay_ms(10u32);
             ms += 10;
+            idle_ms += 10;
             if ms >= 1000 {
                 ms = 0;
                 let buf = framebuf_mut();
                 draw_battery(buf, battery_raw_to_pct(read_battery_raw()));
                 display.flush(battery_rect());
             }
+            if idle_ms >= 30_000 { enter_dormant(&mut display); }
             if touch.read().is_some() { break; }
         }
     }
@@ -469,7 +472,7 @@ fn main() -> ! {
                 }
                 timer.delay_ms(1u32);
                 idle_ms += 1;
-                if idle_ms >= 15_000 {
+                if idle_ms >= 30_000 {
                     enter_dormant(&mut display);
                 }
             };
@@ -811,13 +814,17 @@ fn main() -> ! {
                         timer.delay_ms(33u32);
                     }
                 } else {
-                    // Lose: just wait for tap inside face
+                    // Lose: wait for tap inside face, or sleep after 30 s
+                    let mut idle_ms: u32 = 0;
                     loop {
                         if let Some((tx, ty)) = touch.read() {
                             let dx = tx as f32 - CX;
                             let dy = ty as f32 - CY;
                             if dx * dx + dy * dy <= 90.0 * 90.0 { break; }
                         }
+                        timer.delay_ms(1u32);
+                        idle_ms += 1;
+                        if idle_ms >= 30_000 { enter_dormant(&mut display); }
                     }
                     loop { if touch.read().is_none() { break; } }
                 }
