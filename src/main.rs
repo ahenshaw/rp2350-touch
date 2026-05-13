@@ -398,7 +398,20 @@ fn main() -> ! {
         draw_battery(buf, battery_raw_to_pct(read_battery_raw()));
     }
     display.flush(Rectangle::new(Point::zero(), Size::new(W as u32, H as u32)));
-    loop { if touch.read().is_some() { break; } }
+    {
+        let mut ms: u32 = 0;
+        loop {
+            timer.delay_ms(10u32);
+            ms += 10;
+            if ms >= 1000 {
+                ms = 0;
+                let buf = framebuf_mut();
+                draw_battery(buf, battery_raw_to_pct(read_battery_raw()));
+                display.flush(battery_rect());
+            }
+            if touch.read().is_some() { break; }
+        }
+    }
     loop { if touch.read().is_none() { break; } }
 
     // Track geometry is fixed by the arena constants — compute once.
@@ -812,6 +825,11 @@ fn main() -> ! {
             }
         }
     }
+}
+
+fn battery_rect() -> Rectangle {
+    // Matches the body+nub bounding box in draw_battery (BX=215, BY=422, BW+NW=36, BH=16)
+    Rectangle::new(Point::new(215, 422), Size::new(36, 16))
 }
 
 fn draw_battery(buf: &mut [u16], pct: u8) {
